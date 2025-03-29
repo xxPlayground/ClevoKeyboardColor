@@ -2,6 +2,7 @@
 #include <future>
 #include <array>
 #include <windows.h>
+#include <processthreadsapi.h>
 #include <thread>
 #include <chrono>
 #include <atomic>
@@ -56,6 +57,37 @@ void ColorUpdateThread() {
 }
 
 int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    PROCESS_POWER_THROTTLING_STATE powerThrottling = {
+        .Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        .ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        .StateMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+    };
+
+    SetProcessInformation(
+        GetCurrentProcess(),
+        ProcessPowerThrottling,
+        &powerThrottling,
+        sizeof(powerThrottling)
+    );
+
+    HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+    if (hKernel32) {
+        typedef BOOL(WINAPI* PFN_SET_PROCESS_INFORMATION)(HANDLE, PROCESS_INFORMATION_CLASS, LPVOID, DWORD);
+        auto pfnSetProcessInformation = (PFN_SET_PROCESS_INFORMATION)GetProcAddress(hKernel32, "SetProcessInformation");
+
+        if (pfnSetProcessInformation) {
+            PROCESS_POWER_THROTTLING_STATE state = {
+                .Version = 1,
+                .ControlMask = 0x1,
+                .StateMask = 0x1
+            };
+            pfnSetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state, sizeof(state));
+        }
+    }
+
+    SetPriorityClass(GetCurrentProcess(), IDLE_PRIORITY_CLASS);
+    SetThreadPriority(GetCurrentProcess(), THREAD_PRIORITY_IDLE);
+
     LPCWSTR mutexName = L"ClevoKeyboardColor";
     HANDLE hMutex = CreateMutexW(NULL, TRUE, mutexName);
 
@@ -80,7 +112,10 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
     }
 
     setBrightness(255);
-    std::thread(ColorUpdateThread).detach();
+
+    std::thread colorThread(ColorUpdateThread);
+    SetThreadPriority(ColorUpdateThread, THREAD_PRIORITY_IDLE);
+    colorThread.detach();
 
     MSG msg;
     while (GetMessage(&msg, nullptr, 0, 0)) {
