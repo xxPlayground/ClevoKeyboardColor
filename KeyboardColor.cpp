@@ -1,119 +1,98 @@
 #include <iostream>
 #include <future>
 #include <array>
-
 #include <windows.h>
+#include <processthreadsapi.h>
+#include <thread>
+#include <chrono>
+#include <atomic>
+#include <mmdeviceapi.h>
+#include <endpointvolume.h>
 
-
-extern "C"  typedef int (*SetDCHU_DataPtr)(int command, byte* buffer, int length);
+extern "C" typedef int (*SetDCHU_DataPtr)(int command, byte* buffer, int length);
 
 SetDCHU_DataPtr SetDCHU_Data;
-
+std::atomic<bool> running(true);
 
 void setBrightness(byte v) {
     std::array<byte, 4> buf{ v, 0, 0, 244 };
     SetDCHU_Data(103, buf.data(), 4);
 }
 
-HWND lastHwnd = NULL;
+float getAudioPeak() {
+    CoInitialize(NULL);
 
-VOID CALLBACK WinEventProcCallback(HWINEVENTHOOK hWinEventHook, DWORD dwEvent, HWND hwnd, LONG idObject, LONG idChild, DWORD dwEventThread, DWORD dwmsEventTime) {
+    IMMDeviceEnumerator* pEnumerator = NULL;
+    IMMDevice* pDevice = NULL;
+    IAudioMeterInformation* pMeterInfo = NULL;
+    float peak = 0.0f;
 
-    if (lastHwnd == hwnd || !hwnd)
-        return;
+    HRESULT hr = CoCreateInstance(
+        __uuidof(MMDeviceEnumerator), NULL,
+        CLSCTX_ALL, __uuidof(IMMDeviceEnumerator),
+        (void**)&pEnumerator);
 
-    if (dwEvent == EVENT_SYSTEM_FOREGROUND || dwEvent == EVENT_SYSTEM_MINIMIZEEND || dwEvent == EVENT_SYSTEM_MINIMIZESTART) {
-
-        if (!IsWindowVisible(hwnd))
-            return;
-
-        HICON hIcon = 0;
-        if (!hIcon) SendMessageTimeoutA(hwnd, WM_GETICON, ICON_SMALL, NULL, SMTO_ABORTIFHUNG | SMTO_BLOCK, 30, (PDWORD_PTR)&hIcon);
-        if (!hIcon) SendMessageTimeoutA(hwnd, WM_GETICON, ICON_BIG, NULL, SMTO_ABORTIFHUNG | SMTO_BLOCK, 30, (PDWORD_PTR)&hIcon);
-        if (!hIcon) hIcon = (HICON)GetClassLongPtr(hwnd, GCLP_HICONSM);
-        if (!hIcon) hIcon = (HICON)GetClassLongPtr(hwnd, GCLP_HICON);
-        if (!hIcon) {
-#ifndef NDEBUG
-            std::cout << "Could not find icon" << std::endl;
-#endif
-            return;
-        }
-
-        ICONINFO iconinfo;
-        if (!GetIconInfo(hIcon, &iconinfo)) {
-#ifndef NDEBUG
-            std::cout << "Could not get icon info" << std::endl;
-#endif
-            return;
-        }
-        HBITMAP& hbm = iconinfo.hbmColor;
-        if (!hbm) {
-#ifndef NDEBUG
-            std::cout << "Could not get icon hbmColor" << std::endl;
-#endif
-            return;
-        }
-
-        BITMAP bm;
-        if (!GetObject(hbm, sizeof(BITMAP), &bm)) {
-#ifndef NDEBUG
-            std::cout << "Could not get bitmap" << std::endl;
-#endif
-            return;
-        }
-
-        LONG pixelCount = bm.bmWidth * bm.bmHeight;
-
-        BITMAPINFO bmi;
-        memset(&bmi, 0, sizeof(bmi));
-        bmi.bmiHeader.biSize = sizeof(BITMAPINFO);
-        bmi.bmiHeader.biWidth = bm.bmWidth;
-        bmi.bmiHeader.biHeight = -bm.bmHeight;
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB;
-        bmi.bmiHeader.biSizeImage = pixelCount * 4;
-
-        auto lpPixels = std::vector<uint32_t>(pixelCount);
-        if (!GetDIBits(GetDC(hwnd), hbm, 0, bm.bmHeight, lpPixels.data(), &bmi, DIB_RGB_COLORS)) {
-#ifndef NDEBUG
-            std::cout << "Could not copy icon image" << std::endl;
-#endif
-            return;
-        }
-        
-        constexpr float GAMMA = 2;
-        uint64_t rSum = 0, gSum = 0, bSum = 0;
-        for (const auto& p : lpPixels)
-            if (p >= 0xff000000) {
-                uint64_t r = (p & 0xff0000) >> 16, g = (p & 0xff00) >> 8, b = p & 0xff;
-                uint64_t min = (std::min)({ r, g, b });
-                uint64_t max = (std::max)({ r, g, b });
-                uint64_t weight = max - min;
-                rSum += r * r * weight;
-                gSum += g * g * weight;
-                bSum += b * b * weight;
-            }
-
-        uint64_t max = (std::max)({ rSum, gSum, bSum, 255ULL });
-        rSum = rSum * 255 / max;
-        gSum = gSum * 255 / max;
-        bSum = bSum * 255 / max;
-
-        lastHwnd = hwnd;
-
-        std::array<byte, 4> buffer = { gSum, rSum, bSum, 240 };
-        SetDCHU_Data(103, buffer.data(), 4);
-
-#ifndef NDEBUG
-        std::array<char, 256> title{ 0 };
-        GetWindowTextA(hwnd, title.data(), 256);
-
-        printf("%02x%02x%02x %s\n", rSum, gSum, bSum, title.data());
-#endif
+    if (SUCCEEDED(hr)) {
+        hr = pEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &pDevice);
     }
+
+    if (SUCCEEDED(hr)) {
+        hr = pDevice->Activate(__uuidof(IAudioMeterInformation), CLSCTX_ALL, NULL, (void**)&pMeterInfo);
+    }
+
+    if (SUCCEEDED(hr)) {
+        hr = pMeterInfo->GetPeakValue(&peak);
+    }
+
+    if (pMeterInfo) pMeterInfo->Release();
+    if (pDevice) pDevice->Release();
+    if (pEnumerator) pEnumerator->Release();
+
+    CoUninitialize();
+
+    return peak;
 }
 
+void ColorUpdateThread() {
+    static const std::array<std::array<byte, 4>, 100> colorTable = [] {
+        std::array<std::array<byte, 4>, 100> table;
+        for (int i = 0; i < 100; ++i) {
+            float hue = i / 100.0f;
+            float h = hue * 6.0f;
+            int sector = static_cast<int>(h) % 6;
+            float f = h - static_cast<int>(h);
+
+            float r, g, b;
+            switch (sector) {
+            case 0: r = 1.0f; g = f;     b = 0.0f; break;
+            case 1: r = 1 - f;  g = 1.0f;  b = 0.0f; break;
+            case 2: r = 0.0f; g = 1.0f;  b = f;    break;
+            case 3: r = 0.0f; g = 1 - f;   b = 1.0f; break;
+            case 4: r = f;    g = 0.0f;  b = 1.0f; break;
+            case 5: r = 1.0f; g = 0.0f;  b = 1 - f;  break;
+            default: r = g = b = 0.0f; break;
+            }
+
+            table[i] = {
+                static_cast<byte>(g * 255),
+                static_cast<byte>(r * 255),
+                static_cast<byte>(b * 255),
+                240
+            };
+        }
+        return table;
+        }();
+
+    int idx = 0;
+    while (running) {
+        float peak = getAudioPeak();
+        int step = static_cast<int>(peak * 6) + 1;
+
+        SetDCHU_Data(103, const_cast<byte*>(colorTable[idx].data()), 4);
+        idx = (idx + step) % 100;
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    }
+}
 
 int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     PROCESS_POWER_THROTTLING_STATE powerThrottling = {
@@ -148,31 +127,44 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
     SetThreadPriority(GetCurrentProcess(), THREAD_PRIORITY_IDLE);
 
     LPCWSTR mutexName = L"ClevoKeyboardColor";
-    HANDLE hHandle = CreateMutex(NULL, TRUE, mutexName);
-    if (ERROR_ALREADY_EXISTS == GetLastError())
+    HANDLE hMutex = CreateMutexW(NULL, TRUE, mutexName);
+
+    if (hMutex == NULL || GetLastError() == ERROR_ALREADY_EXISTS) {
+        if (hMutex) CloseHandle(hMutex);
         return -1;
+    }
 
-    auto hdl = LoadLibraryA("InsydeDCHU.dll");
-    if (!hdl)
+    HMODULE hDll = LoadLibraryA("InsydeDCHU.dll");
+    if (!hDll) {
+        ReleaseMutex(hMutex);
+        CloseHandle(hMutex);
         return 1;
+    }
 
-    SetDCHU_Data = reinterpret_cast<SetDCHU_DataPtr>(GetProcAddress(hdl, "SetDCHU_Data"));
-    if (!SetDCHU_Data)
+    SetDCHU_Data = reinterpret_cast<SetDCHU_DataPtr>(GetProcAddress(hDll, "SetDCHU_Data"));
+    if (!SetDCHU_Data) {
+        FreeLibrary(hDll);
+        ReleaseMutex(hMutex);
+        CloseHandle(hMutex);
         return 2;
-
+    }
 
     setBrightness(255);
 
-    SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, NULL, WinEventProcCallback, 0, 0, WINEVENT_OUTOFCONTEXT);
+    std::thread colorThread(ColorUpdateThread);
+    SetThreadPriority(ColorUpdateThread, THREAD_PRIORITY_IDLE);
+    colorThread.detach();
 
-    WinEventProcCallback(NULL, EVENT_SYSTEM_FOREGROUND, GetForegroundWindow(), 0, 0, NULL, NULL);
     MSG msg;
-    while (GetMessage(&msg, NULL, 0, 0)) {
+    while (GetMessage(&msg, nullptr, 0, 0)) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
-        WinEventProcCallback(NULL, EVENT_SYSTEM_FOREGROUND, GetForegroundWindow(), 0, 0, NULL, NULL);
     }
 
-    FreeLibrary(hdl);
+    running = false;
+    ReleaseMutex(hMutex);
+    CloseHandle(hMutex);
+    FreeLibrary(hDll);
 
+    return static_cast<int>(msg.wParam);
 }
