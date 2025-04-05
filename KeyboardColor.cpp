@@ -1,5 +1,3 @@
-
-
 #include <iostream>
 #include <future>
 #include <array>
@@ -118,8 +116,38 @@ VOID CALLBACK WinEventProcCallback(HWINEVENTHOOK hWinEventHook, DWORD dwEvent, H
 
 
 int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    PROCESS_POWER_THROTTLING_STATE powerThrottling = {
+        .Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        .ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        .StateMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+    };
 
-    LPCWSTR mutexName = L"L0laapk3_ClevoKeyboardColor";
+    SetProcessInformation(
+        GetCurrentProcess(),
+        ProcessPowerThrottling,
+        &powerThrottling,
+        sizeof(powerThrottling)
+    );
+
+    HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+    if (hKernel32) {
+        typedef BOOL(WINAPI* PFN_SET_PROCESS_INFORMATION)(HANDLE, PROCESS_INFORMATION_CLASS, LPVOID, DWORD);
+        auto pfnSetProcessInformation = (PFN_SET_PROCESS_INFORMATION)GetProcAddress(hKernel32, "SetProcessInformation");
+
+        if (pfnSetProcessInformation) {
+            PROCESS_POWER_THROTTLING_STATE state = {
+                .Version = 1,
+                .ControlMask = 0x1,
+                .StateMask = 0x1
+            };
+            pfnSetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state, sizeof(state));
+        }
+    }
+
+    SetPriorityClass(GetCurrentProcess(), IDLE_PRIORITY_CLASS);
+    SetThreadPriority(GetCurrentProcess(), THREAD_PRIORITY_IDLE);
+
+    LPCWSTR mutexName = L"ClevoKeyboardColor";
     HANDLE hHandle = CreateMutex(NULL, TRUE, mutexName);
     if (ERROR_ALREADY_EXISTS == GetLastError())
         return -1;
